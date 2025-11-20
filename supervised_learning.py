@@ -6,11 +6,11 @@ from lets_plot import *
 # packages for Supervised Learning
 
 
-from sklearn.linear_model import LinearRegression # Least Squares
+from sklearn.linear_model import LinearRegression, LogisticRegression
 
 from sklearn.svm import SVR # Support Vector Machine
 
-from sklearn.neighbors import KNeighborsRegressor # K-Nearest Neighbors
+from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
 
 from sklearn.linear_model import ElasticNet # Elastic Net Penalty
 from sklearn.linear_model import Lasso # LASSO
@@ -19,12 +19,14 @@ from sklearn.linear_model import Lasso # LASSO
 from sklearn.tree import DecisionTreeRegressor # Decision Tree
 
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.ensemble import ExtraTreesRegressor
-
-
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.ensemble import AdaBoostRegressor
+from sklearn.ensemble import (
+    RandomForestRegressor, 
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    AdaBoostRegressor,
+    RandomForestClassifier,
+    GradientBoostingClassifier
+)
 
 from sklearn.neural_network import MLPRegressor
 
@@ -41,15 +43,76 @@ from sklearn.model_selection import cross_val_score, KFold, GridSearchCV
 import statsmodels.tsa.arima.model as stats
 from statsmodels.graphics.tsaplots import plot_acf
 
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, accuracy_score
 
+from feature_engineering import create_all_features
+
+
+# ============================================================
+# LABEL CONSTRUCTION
+# ============================================================
+
+def make_future_log_return(df, price_column="Close", horizon=1):
+    """
+    Y_t = log(Close_{t+h}) - log(Close_t)
+    """
+    y = np.log(df[price_column]).shift(-horizon) - np.log(df[price_column])
+    y.name = f"future_logret_{horizon}"
+    return y
+
+
+def make_direction_label(y: pd.Series, threshold=0.0):
+    """
+    Convert continuous future returns → binary direction.
+    """
+    y_class = (y > threshold).astype(int)
+    y_class.name = f"{y.name}_class"
+    return y_class
 
 class SupervisedLearning:
 
     def __init__(self):
         """Initialize all regression models."""
         self.models = []
+        self.scaler = StandardScaler()
         self._init_models()
+        self._init_regression()
+        self._init_classifiers()
+
+    # -----------------------------
+    # Regression Models
+    # -----------------------------
+    def _init_regression(self):
+        self.reg_models = [
+            ("LR", LinearRegression()),
+            ("LASSO", Lasso()),
+            ("ElasticNet", ElasticNet()),
+            ("DecisionTree", DecisionTreeRegressor()),
+            ("RandomForest", RandomForestRegressor()),
+            ("ExtraTrees", ExtraTreesRegressor()),
+            ("GradientBoosting", GradientBoostingRegressor()),
+            ("AdaBoost", AdaBoostRegressor()),
+            ("SVR", SVR()),
+            ("KNN", KNeighborsRegressor())
+        ]
+
+    # -----------------------------
+    # Classification Models
+    # -----------------------------
+    def _init_classifiers(self):
+        self.clf_models = [
+            ("Logistic", LogisticRegression(max_iter=500)),
+            ("RandomForest", RandomForestClassifier()),
+            ("GradientBoosting", GradientBoostingClassifier()),
+            ("KNN_Classifier", KNeighborsClassifier()),
+        ]
+
+    def get_classifier_by_name(self, name):
+        for n, m in self.clf_models:
+            if n == name:
+                return m
+        raise ValueError("Classifier name not found")
+
 
     def _init_models(self):
         # Linear Models
@@ -96,6 +159,23 @@ class SupervisedLearning:
         print(f"Sequential Split: {len(X_train)} train / {len(X_test)} test samples")
         return X_train, X_test, Y_train, Y_test
     
+
+    # Train ALL classifiers & report accuracy
+    # -----------------------------
+    def run_all_classifiers(self, X_train, Y_train, X_test, Y_test):
+        results = []
+
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled  = self.scaler.transform(X_test)
+
+        for name, model in self.clf_models:
+            model.fit(X_train_scaled, Y_train)
+            y_pred = model.predict(X_test_scaled)
+            acc = accuracy_score(Y_test, y_pred)
+            results.append((name, acc))
+            print(f"{name}: accuracy={acc:.4f}")
+
+        return pd.DataFrame(results, columns=["Model", "Accuracy"])
 
     def run_all_models(self, X_train, Y_train, X_test, Y_test, 
                        num_folds=10, seed=42, metric="neg_mean_squared_error"):
@@ -158,3 +238,88 @@ class SupervisedLearning:
         )
 
         performance_comparison.show()
+
+
+    def tune_probability_threshold(
+        self,
+        model,
+        X_train, y_train,
+        X_test, y_test,
+        thresholds = np.arange(0.50, 0.80, 0.01),
+        return_metric = "sharpe"
+    ):
+        """
+        Cross-validate classification thresholds.
+
+        return_metric: 'sharpe' or 'accuracy'
+        """
+
+        if model is None:
+            raise ValueError("Model cannot be None")
+
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled  = self.scaler.transform(X_test)
+
+
+        # Fit classifier once
+        model.fit(X_train_scaled, y_train)
+
+        # Predicted probability of going UP
+        p_train = model.predict_proba(X_train_scaled)[:, 1]
+        p_test  = model.predict_proba(X_test_scaled)[:, 1]
+
+        results = []
+
+        for th in thresholds:
+
+            train_pred = (p_train > th).astype(int)
+            test_pred  = (p_test > th).astype(int)
+            # Convert to +1/-1 returns strategy
+            train_ret = train_pred * y_train
+            test_ret  = test_pred * y_test
+
+            # Compute Sharpe
+            train_sharpe = (
+                train_ret.mean() / train_ret.std() * np.sqrt(252)
+                if train_ret.std() != 0 else np.nan
+            )
+            test_sharpe = (
+                test_ret.mean() / test_ret.std() * np.sqrt(252)
+                if test_ret.std() != 0 else np.nan
+            )
+
+            # Classification accuracy
+            train_acc = accuracy_score(y_train, train_pred)
+            test_acc  = accuracy_score(y_test, test_pred)
+
+            results.append({
+                "threshold": th,
+                "train_sharpe": train_sharpe,
+                "test_sharpe": test_sharpe,
+                "train_accuracy": train_acc,
+                "test_accuracy": test_acc
+            })
+
+        df = pd.DataFrame(results)
+
+        # Pick the optimal threshold
+        if return_metric == "sharpe":
+            best_row = df.loc[df["train_sharpe"].idxmax()]
+        else:
+            best_row = df.loc[df["train_accuracy"].idxmax()]
+
+        best_threshold = best_row["threshold"]
+
+        print(f"\nBest Threshold = {best_threshold:.3f}")
+        print(best_row)
+
+        # Also compute final predictions on test set
+        final_test_pred = (p_test > best_threshold).astype(int)
+
+        return {
+            "threshold_cv_results": df,
+            "best_threshold": best_threshold,
+            "best_row": best_row,
+            "final_test_pred": final_test_pred,
+            "model": model
+        }
